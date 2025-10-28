@@ -3,21 +3,22 @@ package f5api
 import (
 	"bytes"
 	"crypto/tls"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"math/rand"
 	"net/http"
+	"sync"
 	"time"
 )
 
 const (
-	defaultTimeout = 10 * time.Second
-	loginURL       = "/mgmt/shared/authn/login"
-	logoutURL      = "/mgmt/shared/authz/tokens/"
-	poolStatsURL   = "/mgmt/tm/ltm/pool/stats"
-	syncStatusURL  = "/mgmt/tm/cm/sync-status"
+	defaultTimeout     = 10 * time.Second
+	loginURL           = "/mgmt/shared/authn/login"
+	refreshTokenURL    = "/mgmt/shared/authz/tokens/"
+	poolStatsURL       = "/mgmt/tm/ltm/pool/stats"
+	syncStatusURL      = "/mgmt/tm/cm/sync-status"
+	tokenRefreshWindow = 5 * time.Minute // refresh before expiry
 )
 
 type Model struct {
@@ -25,8 +26,14 @@ type Model struct {
 	Pass       string
 	Host       string
 	Port       string
-	MaxRetries int           // Retry attempts for HTTP requests
-	RetryDelay time.Duration // Initial backoff duration
+	MaxRetries int
+	RetryDelay time.Duration
+
+	mu           sync.Mutex
+	sessionToken string
+	tokenExpires time.Time
+	stopCh       chan struct{}
+	running      bool
 }
 
 // -----------------------------
@@ -35,7 +42,8 @@ type Model struct {
 
 type F5Token struct {
 	Token struct {
-		Token string `json:"token"`
+		Token            string `json:"token"`
+		ExpirationMicros int64  `json:"expirationMicros"`
 	} `json:"token"`
 }
 
@@ -95,20 +103,105 @@ type SyncEntry struct {
 }
 
 // -----------------------------
-// API Methods
+// Token Lifecycle
 // -----------------------------
 
-// Login logs into the F5 device and returns a session token.
-func (m *Model) Login() (string, error) {
+// StartTokenRefresher launches a background goroutine that automatically refreshes the token.
+func (m *Model) StartTokenRefresher() {
+	m.mu.Lock()
+	if m.running {
+		m.mu.Unlock()
+		return
+	}
+	m.stopCh = make(chan struct{})
+	m.running = true
+	m.mu.Unlock()
+
+	go func() {
+		for {
+			sleepDur := m.timeUntilRefresh()
+			select {
+			case <-time.After(sleepDur):
+				if err := m.refreshToken(); err != nil {
+					fmt.Println("[f5api] token refresh failed:", err)
+					// Try full re-login on next cycle
+					m.mu.Lock()
+					m.sessionToken = ""
+					m.mu.Unlock()
+				}
+			case <-m.stopCh:
+				return
+			}
+		}
+	}()
+}
+
+// StopTokenRefresher stops the background token refresher goroutine.
+func (m *Model) StopTokenRefresher() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.running {
+		return
+	}
+	close(m.stopCh)
+	m.running = false
+}
+
+func (m *Model) timeUntilRefresh() time.Duration {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.tokenExpires.IsZero() {
+		return 10 * time.Second
+	}
+	until := time.Until(m.tokenExpires.Add(-tokenRefreshWindow))
+	if until < 10*time.Second {
+		until = 10 * time.Second
+	}
+	return until
+}
+
+// refreshToken uses the existing token to extend its lifetime.
+func (m *Model) refreshToken() error {
+	token, err := m.getToken()
+	if err != nil {
+		return err
+	}
+
+	url := m.apiURL(refreshTokenURL + token)
+	resp, err := m.doRequest("GET", url, "", nil, token)
+	if err != nil {
+		return fmt.Errorf("token refresh GET failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("token refresh failed: HTTP %d", resp.StatusCode)
+	}
+
+	// Extend expiry again
+	m.mu.Lock()
+	m.tokenExpires = time.Now().Add(9 * time.Hour)
+	m.mu.Unlock()
+	return nil
+}
+
+// getToken ensures a valid token exists and returns it.
+func (m *Model) getToken() (string, error) {
+	m.mu.Lock()
+	if m.sessionToken != "" && time.Now().Before(m.tokenExpires.Add(-tokenRefreshWindow)) {
+		token := m.sessionToken
+		m.mu.Unlock()
+		return token, nil
+	}
+	m.mu.Unlock()
+
+	// Re-login
 	payload := map[string]string{
 		"username":          m.User,
 		"password":          m.Pass,
 		"loginProviderName": "tmos",
 	}
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal login payload: %w", err)
-	}
+	data, _ := json.Marshal(payload)
 
 	resp, err := m.doRequest("POST", m.apiURL(loginURL), "application/json", bytes.NewReader(data), "")
 	if err != nil {
@@ -125,12 +218,31 @@ func (m *Model) Login() (string, error) {
 		return "", fmt.Errorf("failed to parse auth response: %w", err)
 	}
 
+	expMicros := tokenResp.Token.ExpirationMicros
+	exp := time.Now().Add(9 * time.Hour) // fallback
+	if expMicros > 0 {
+		exp = time.UnixMicro(expMicros)
+	}
+
+	m.mu.Lock()
+	m.sessionToken = tokenResp.Token.Token
+	m.tokenExpires = exp
+	m.mu.Unlock()
+
 	return tokenResp.Token.Token, nil
 }
 
-// GetPoolStats retrieves pool statistics.
-func (m *Model) GetPoolStats(sessionID string) (PoolStats, error) {
-	resp, err := m.doRequest("GET", m.apiURL(poolStatsURL), "", nil, sessionID)
+// -----------------------------
+// API Methods
+// -----------------------------
+
+func (m *Model) GetPoolStats() (PoolStats, error) {
+	token, err := m.getToken()
+	if err != nil {
+		return PoolStats{}, err
+	}
+
+	resp, err := m.doRequest("GET", m.apiURL(poolStatsURL), "", nil, token)
 	if err != nil {
 		return PoolStats{}, fmt.Errorf("pool stats request failed: %w", err)
 	}
@@ -148,9 +260,13 @@ func (m *Model) GetPoolStats(sessionID string) (PoolStats, error) {
 	return stats, nil
 }
 
-// GetSyncStatus returns 1 if in sync, 0 otherwise.
-func (m *Model) GetSyncStatus(sessionID string) (int, error) {
-	resp, err := m.doRequest("GET", m.apiURL(syncStatusURL), "", nil, sessionID)
+func (m *Model) GetSyncStatus() (int, error) {
+	token, err := m.getToken()
+	if err != nil {
+		return 0, err
+	}
+
+	resp, err := m.doRequest("GET", m.apiURL(syncStatusURL), "", nil, token)
 	if err != nil {
 		return 0, fmt.Errorf("sync status request failed: %w", err)
 	}
@@ -170,35 +286,16 @@ func (m *Model) GetSyncStatus(sessionID string) (int, error) {
 		if status == "In Sync" {
 			return 1, nil
 		}
-		break // Only check first entry (single device assumed)
+		break
 	}
-
 	return 0, nil
-}
-
-// Logout terminates the session.
-func (m *Model) Logout(sessionID string) error {
-	url := m.apiURL(logoutURL + sessionID)
-	authHeader := "Basic " + basicAuth(m.User, m.Pass)
-
-	resp, err := m.doRequest("DELETE", url, "", nil, authHeader)
-	if err != nil {
-		return fmt.Errorf("logout request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("logout failed: HTTP %d", resp.StatusCode)
-	}
-
-	return nil
 }
 
 // -----------------------------
 // HTTP Request Handling
 // -----------------------------
 
-func (m *Model) doRequest(method, url, contentType string, body io.Reader, authHeader string) (*http.Response, error) {
+func (m *Model) doRequest(method, url, contentType string, body io.Reader, token string) (*http.Response, error) {
 	if m.MaxRetries <= 0 {
 		m.MaxRetries = 3
 	}
@@ -209,14 +306,13 @@ func (m *Model) doRequest(method, url, contentType string, body io.Reader, authH
 	client := &http.Client{
 		Timeout: defaultTimeout,
 		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // ⚠️ Don't use in production
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // ⚠️ disable in production
 		},
 	}
 
 	var lastErr error
 	backoff := m.RetryDelay
 
-	// Read and store body bytes for retries
 	var bodyBytes []byte
 	if body != nil {
 		bodyBytes, _ = io.ReadAll(body)
@@ -237,20 +333,14 @@ func (m *Model) doRequest(method, url, contentType string, body io.Reader, authH
 		if contentType != "" {
 			req.Header.Set("Content-Type", contentType)
 		}
-		if authHeader != "" {
-			if method == "DELETE" {
-				req.Header.Set("Authorization", authHeader)
-			} else {
-				req.Header.Set("X-F5-Auth-Token", authHeader)
-			}
+		if token != "" {
+			req.Header.Set("X-F5-Auth-Token", token)
 		}
 
 		resp, err := client.Do(req)
 		if err == nil && resp.StatusCode < 500 {
 			return resp, nil
 		}
-
-		// Handle retryable error
 		if resp != nil {
 			resp.Body.Close()
 		}
@@ -262,7 +352,6 @@ func (m *Model) doRequest(method, url, contentType string, body io.Reader, authH
 			backoff *= 2
 		}
 	}
-
 	return nil, fmt.Errorf("request failed after %d attempts: %w", m.MaxRetries+1, lastErr)
 }
 
@@ -276,8 +365,4 @@ func (m *Model) apiURL(path string) string {
 
 func decodeJSON(r io.Reader, v any) error {
 	return json.NewDecoder(r).Decode(v)
-}
-
-func basicAuth(user, pass string) string {
-	return base64.StdEncoding.EncodeToString([]byte(user + ":" + pass))
 }
