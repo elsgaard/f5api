@@ -9,9 +9,9 @@ import (
 
 func main() {
 	f5 := f5api.Model{
-		User:       "monitoring",
-		Pass:       "TrueCom2024",
-		Host:       "f5-lb1.b2bi.dk",
+		User:       "f5-user",
+		Pass:       "f5-pass",
+		Host:       "f5-host.com",
 		Port:       "443",
 		MaxRetries: 3,
 		RetryDelay: 500 * time.Millisecond,
